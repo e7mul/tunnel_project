@@ -7,6 +7,8 @@ import torchvision.transforms as transforms
 from tunnel_methods import (
     RepresentationsSpectra,
     EarlyExit,
+    TSNE,
+    LDA
 )
 
 
@@ -37,7 +39,7 @@ def analysis(rpath):
     )
 
     # ---------------------------------------------------------------------------
-    # Representations Spectra
+    # Representations Spectra (Figure 2 -- numerical rank)
     # ---------------------------------------------------------------------------
     repr_spectra = RepresentationsSpectra(
         model,
@@ -50,7 +52,7 @@ def analysis(rpath):
     repr_spectra.plot(name="representations_spectra")
     repr_spectra.clean_up()
     # ---------------------------------------------------------------------------
-    # Early Exit ID 
+    # Early Exit ID (Figure 2 -- Linear probing ACC)
     # ---------------------------------------------------------------------------
     early_exit = EarlyExit(
         model,
@@ -65,23 +67,19 @@ def analysis(rpath):
     early_exit.plot(name="early_exits")
     early_exit.clean_up()
     # ---------------------------------------------------------------------------
-    # Early Exit OOD 
+    # Compute LDA(Figure 3 -- inter / intra class variance)
     # ---------------------------------------------------------------------------
+    lda = LDA(model, test_data, layers, rpath=rpath)
+    lda.analysis()
+    lda.plot(name="inter_intra_class_variance")
+    # ---------------------------------------------------------------------------
+    # Compute TSNE
+    # ---------------------------------------------------------------------------
+    tsne = TSNE(model, test_data, layers, rpath=rpath)
+    tsne.analysis()
+    tsne.plot()
 
-    # Here load some OOD datasets, the rest is the same
 
-    # early_exit = EarlyExit(
-    # model,
-    # train_datsets=train_datasets_ood,
-    # test_datasets=test_datasets_ood,
-    # layers=layers,
-    # rpath=rpath,
-    # )
-
-    # early_exit.analysis()
-    # early_exit.export(name="early_exits_OOD")
-    # early_exit.plot(name="early_exits_OOD")
-    # early_exit.clean_up()
    
 if __name__ == "__main__":
 

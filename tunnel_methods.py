@@ -7,6 +7,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import random_split, DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 
 class LinearProbe(nn.Module):
@@ -91,8 +92,6 @@ class LinearProbe(nn.Module):
         )
         if self.cuda:
             self.linear_probe.cuda()
-
-
 
 
 class BaseAnalysis:
@@ -218,7 +217,6 @@ class EarlyExit(BaseAnalysis):
             X_train, y_train = self.collect_activations(train_loader, layer_name)
             self._clean_up()
             X_test, y_test = self.collect_activations(test_loader, layer_name)
-            print(X_test.shape, y_test)
             self.backbone = self.backbone.cpu()
             linear_head = self.train(X_train, y_train)
             self.result[layer_name] = linear_head.evaluate((X_test, y_test))
@@ -272,6 +270,92 @@ class EarlyExit(BaseAnalysis):
         plt.ylabel("Accuracy")
         plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
         plt.close()
+
+
+class LDA(RepresentationsSpectra):
+        def analysis(self):
+            self.input_shape = {}
+            self.result = {'lda':{}, 'inter':{}, 'intra':{}}
+            if len(self.representations) == 0:
+                self.collect_representations_and_labels()
+            for layer in self.representations.keys():
+                self.result['lda'][layer], self.result['inter'][layer], self.result['intra'][layer] = self.discriminability(layer)
+            return self.result
+
+
+        def _spectra_hook(self, name):
+            def spectra_hook(model, input, output):
+                MAX_REPR_SIZE = 100000
+                representation_size = int(output.numel()/output.shape[0])
+                output = output.flatten(1)
+                if representation_size > MAX_REPR_SIZE:                
+                    output = output[:, np.random.choice(representation_size, MAX_REPR_SIZE, replace=False)]
+                self.representations[name] = self.representations.get(name, []) + [output]
+                self.input_shape[name] = [i for i in input[0].shape[2:]]
+            return spectra_hook
+
+        @torch.no_grad()
+        def collect_representations_and_labels(self):
+            self.labels = []
+            self.model.eval()
+            with torch.no_grad():
+                for x, y, *_ in self.data:
+                    if torch.cuda.is_available():
+                        x = x.cuda()
+                    _ = self.model(x)
+                    self.labels += [i.item() for i in y]
+            for name, rep in self.representations.items():
+                self.representations[name] = torch.cat(rep, dim=0).cpu().detach()
+            
+            for handle in self.handels:
+                handle.remove()
+            return self.representations
+            
+        def discriminability(self, layer,):
+            phi = self.representations[layer]
+            print(layer, phi.shape)
+            labels = np.array(self.labels)
+            phi_norm = torch.nn.functional.normalize(phi,p=2,dim=1)
+            class_centers = {i:phi_norm[labels==i].mean(dim=0) for i in np.unique(labels)}
+            inter_class = torch.pdist(torch.stack([class_centers[i] for i in np.unique(labels)])).pow(2).mean()
+            intra_class = np.mean([(phi_norm[labels==i] - class_centers[i]).norm(dim=1).pow(2).mean() for i in np.unique(labels)])
+            return inter_class/intra_class, inter_class, intra_class
+        
+        def plot(self, name):
+            fig, axs = plt.subplots(1, 1, figsize=(5, 4))
+            axs.plot(self.result['inter'].values(), 'o-',label='Inter-class variance')
+            axs.plot(self.result['intra'].values(),'o-', label='Intra-class variance')
+            axs.set_xticks(np.arange(len(self.result['lda'].values())),np.arange(len(self.result['lda'].values()))+1, rotation=0, fontsize=10)
+            axs.set_xlabel("Layer", fontsize=12)
+            axs.set_xlim(-.4, len(self.result['inter'].values())-0.6)
+            plt.legend(fontsize=12)
+            print(os.path.join(self.rpath, name + ".png"))
+            plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
+            plt.close()
+
+
+class TSNE(LDA):
+        def analysis(self):
+            self.input_shape = {}
+            self.result = {}
+            if len(self.representations) == 0:
+                self.collect_representations_and_labels()
+            for layer in self.representations.keys():
+                self.result[layer] = self.tsne(layer)
+            return self.result
+
+        def tsne(self, layer):
+            phi = self.representations[layer]
+            X_embedded = TSNE(n_components=2, learning_rate='auto',
+                  init='random', perplexity=30, n_iter=1000).fit_transform(phi)
+            return X_embedded
+        
+        def plot(self):
+            for e, (key, val) in enumerate(self.result.items()):
+                fig, axs = plt.subplots(1, 1, figsize=(6, 6))
+                axs.scatter(val[:,0], val[:,1], s=0.5, label=key, color=plt.cm.Set1(np.array(self.labels)/10.))
+                axs.axis('off')
+                plt.savefig(os.path.join(self.rpath, f"t-sne_{key}.png"), dpi=500)
 
 
 if __name__ == "__main__":
