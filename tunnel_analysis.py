@@ -1,11 +1,31 @@
+import os
+
+import matplotlib.pyplot as plt
 from torchvision.models import resnet18
 import torch
 import torchvision
 import torchvision.transforms as transforms
 
 
-from tunnel_methodsv2 import Rank, EarlyExit
-from plotters import rank_plot, exits_plot
+from tunnel_methods import Rank, EarlyExit
+
+
+
+def rank_plot(result, rpath, name):
+    effective_rank = result["rank"]
+    fig, axs = plt.subplots(1, 1, figsize=(10, 10))
+    axs.plot(list(effective_rank.keys()), list(effective_rank.values()), "o-")
+    plt.savefig(os.path.join(rpath, name + ".png"), dpi=500)
+    plt.close()
+
+def exits_plot(self, name):
+    fig, axs = plt.subplots(1, 1, figsize=(10, 10))
+    axs.plot([i for i in self.result.values()], "o-")
+    axs.grid()
+    plt.title("Early Exits")
+    plt.ylabel("Accuracy")
+    plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
+    plt.close()
 
 def analysis(rpath):
 
