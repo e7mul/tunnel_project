@@ -4,19 +4,13 @@ import torchvision
 import torchvision.transforms as transforms
 
 
-from tunnel_methods import (
-    RepresentationsSpectra,
-    EarlyExit,
-    TSNE,
-    LDA
-)
-
-
+from tunnel_methodsv2 import Rank, EarlyExit
+from plotters import rank_plot, exits_plot
 
 def analysis(rpath):
 
     # here you need to load your model with with pretrained weights
-    model = resnet18(pretrained=True)
+    model = resnet18()
     # define layers of the network you want to analyze
     layers = [n for n, m in model.named_modules() if isinstance(m, torch.nn.Conv2d)][::5]
 
@@ -41,11 +35,12 @@ def analysis(rpath):
     # ---------------------------------------------------------------------------
     # Representations Spectra (Figure 2 -- numerical rank)
     # ---------------------------------------------------------------------------
-    repr_spectra = RepresentationsSpectra(
-        model,
+    repr_spectra = Rank(
         test_data,
+        model,
         layers,
         rpath=rpath,
+        plotter = rank_plot
         )
     repr_spectra.analysis()
     repr_spectra.export('representations_spectra')
@@ -55,33 +50,22 @@ def analysis(rpath):
     # Early Exit ID (Figure 2 -- Linear probing ACC)
     # ---------------------------------------------------------------------------
     early_exit = EarlyExit(
-        model,
+        model=model,
         train_data=train_data,
         test_data=test_data,
         layers=layers,
         rpath=rpath,
+        plotter = exits_plot
     )
 
     early_exit.analysis()
     early_exit.export(name="early_exits")
     early_exit.plot(name="early_exits")
     early_exit.clean_up()
-    # ---------------------------------------------------------------------------
-    # Compute LDA(Figure 3 -- inter / intra class variance)
-    # ---------------------------------------------------------------------------
-    lda = LDA(model, test_data, layers, rpath=rpath)
-    lda.analysis()
-    lda.plot(name="inter_intra_class_variance")
-    # ---------------------------------------------------------------------------
-    # Compute TSNE
-    # ---------------------------------------------------------------------------
-    tsne = TSNE(model, test_data, layers, rpath=rpath)
-    tsne.analysis()
-    tsne.plot()
+
 
 
    
 if __name__ == "__main__":
 
     analysis(rpath="test_results")
-
