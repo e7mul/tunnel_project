@@ -1,24 +1,40 @@
 import os
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from functools import partial
+from typing import Callable
+import copy
 
+from loguru import logger
 import torch
+from torch.linalg import matrix_rank
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import random_split, DataLoader, TensorDataset
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
+
+Dataset = torch.utils.data.Dataset
+Model = torch.nn.Module
+Tensor = torch.Tensor
 
 
 class LinearProbe(nn.Module):
-    def __init__(self, feature_size, task_size, epochs=30, lr=1e-3):
+    def __init__(
+        self, feature_size: int, task_size: int, epochs: int = 30, lr: float = 1e-3
+    ):
+        """Train a linear layer (linear probe - LP ) on extracted representations.
+
+        Args:
+            feature_size (int): size of flattened vector of representations
+            task_size (int): number of classes in task
+            epochs (int, optional): number of epochs to train LP. Defaults to 30.
+            lr (float, optional): learning rate to train LP. Defaults to 1e-3.
+        """
         super().__init__()
         self.linear_probe = nn.Linear(feature_size, task_size)
         self.optimizer = torch.optim.Adam(self.linear_probe.parameters(), lr=lr)
         self.criterion = torch.nn.CrossEntropyLoss()
         self.epochs = epochs
         self.best_val_acc = 0.0
-        self.cuda = torch.cuda.is_available()
+        self.cuda = torch.cuda.is_available()  # type: ignore
         if self.cuda:
             self.linear_probe = self.linear_probe.cuda()
 
@@ -38,16 +54,19 @@ class LinearProbe(nn.Module):
         train_loader, val_loader = self.create_loaders((X, y))
         for epoch in range(self.epochs):
             epoch_loss, total, correct = 0, 0, 0
+            e = 0
             for e, (X, y) in enumerate(train_loader):
                 if self.cuda:
                     X, y = X.cuda(), y.cuda()
                 output = self.forward(X)
-                loss = self.criterion(output, y) + 1e-3 * self.linear_probe.weight.norm()
+                loss = (
+                    self.criterion(output, y) + 1e-3 * self.linear_probe.weight.norm()
+                )
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss
-                correct += torch.sum(torch.topk(output, axis=1, k=1)[1].squeeze(1) == y)
+                correct += torch.sum(torch.topk(output, dim=1, k=1)[1].squeeze(1) == y)
                 total += len(X)
             if epoch % 10 == 0 or epoch == self.epochs - 1:
                 print(
@@ -68,7 +87,7 @@ class LinearProbe(nn.Module):
                 X, y = X.cuda(), y.cuda()
             output = self.forward(X)
             correct += torch.sum(
-                torch.topk(output, axis=1, k=1)[1].squeeze(1) == y
+                torch.topk(output, dim=1, k=1)[1].squeeze(1) == y
             ).item()
             total += len(X)
         self.linear_probe.train()
@@ -94,20 +113,42 @@ class LinearProbe(nn.Module):
             self.linear_probe.cuda()
 
 
-class BaseAnalysis:
+class BaseAnalysis(ABC):
+    def __init__(self, rpath, attributes_on_gpu=["backbone"]):
+        self.rpath = rpath
+        self.cuda = torch.cuda.is_available()
+        self.attributes_on_gpu = attributes_on_gpu
+        self.empty_variables()
+        self.result = {}
+
     def export(self, name):
+        os.makedirs(self.rpath, exist_ok=True)
         torch.save(self.result, os.path.join(self.rpath, name + ".pt"))
 
-    def clean_up(self):
+    def move_devices_to_cpu(self):
         for attr in self.attributes_on_gpu:
             try:
                 a = getattr(self, attr)
-                a.to("cpu")
+                a = a.to("cpu")
                 del a
             except AttributeError:
                 pass
-        del self
         torch.cuda.empty_cache()
+
+    def empty_variables(self):
+        # cleans the activations, labels, and registered hooks & handles
+        self.activs = torch.tensor([])
+        self.labels = []
+        try:
+            for handle in self.handles.values():
+                handle.remove()
+        except AttributeError:
+            pass
+        self.handles = {}
+
+    def clean_up(self):
+        self.move_devices_to_cpu()
+        self.empty_variables()
 
     @abstractmethod
     def analysis(self):
@@ -118,132 +159,76 @@ class BaseAnalysis:
         pass
 
 
-class RepresentationsSpectra(BaseAnalysis):
-    def __init__(self, model, data, layers, rpath, MAX_REPR_SIZE=8000):
-        self.model = model
-        self.data = torch.utils.data.DataLoader(data, batch_size=256, shuffle=False)
-        self.layers_to_analyze = layers
-        self.handels = []
-        self._insert_hooks()
-        self.representations = {}
-        self.rpath = rpath
-        self.MAX_REPR_SIZE = MAX_REPR_SIZE
-        os.makedirs(self.rpath, exist_ok=True)
-        self.cuda = torch.cuda.is_available()
-        if self.cuda:
-            self.model = self.model.cuda()
-        self.attributes_on_gpu = ["model"]
-
-    def _spectra_hook(self, name):
-        def spectra_hook(model, input, output):
-            representation_size = int(output.numel()/output.shape[0])
-            output = output.flatten(1)
-            if representation_size > self.MAX_REPR_SIZE:                
-                output = output[:, np.random.choice(representation_size, self.MAX_REPR_SIZE, replace=False)]
-            self.representations[name] = self.representations.get(name, []) + [output]
-        return spectra_hook
-
-    def _insert_hooks(self):
-        for name, layer in self.model.named_modules():
-            if name in self.layers_to_analyze:
-                self.handels.append(layer.register_forward_hook(self._spectra_hook(name)))
-
-    @torch.no_grad()
-    def collect_representations(self):
-        self.model.eval()
-        with torch.no_grad():
-            for x, *_ in self.data:
-                if torch.cuda.is_available():
-                    x = x.cuda()
-                _ = self.model(x)
-        for name, rep in self.representations.items():
-            self.representations[name] = torch.cat(rep, dim=0).cpu().detach()
-        for handle in self.handels:
-            handle.remove()
-        return self.representations
-
-    def analysis(self):
-        if len(self.representations) == 0:
-            self.collect_representations()
-        self.result = {"rank": {}}
-        for name, rep in self.representations.items():
-            rep = torch.cov(rep.T)
-            self.result["rank"][name] = torch.linalg.matrix_rank(rep)
-
-    def plot(self, name):
-        effective_rank = self.result["rank"]
-        fig, axs = plt.subplots(1, 1, figsize=(10, 10))
-        axs.plot(list(effective_rank.keys()), list(effective_rank.values()), "o-")
-        plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
-        plt.close()
-
-
-class EarlyExit(BaseAnalysis):
+class RepresentationsAnalysis(BaseAnalysis):
     def __init__(
         self,
-        backbone,
-        train_data,
-        test_data,
-        layers,
-        rpath,
-        MAX_REPRESENTATION_SIZE=10000,
+        model: Model,
+        layers: list[str],
+        plotter: Callable,
+        max_repr_size: int = 8000,
+        *args,
+        **kwargs,
     ):
-        self.backbone = backbone
-        self.result = {}
-        self.handles = {}
-        self.train_data = train_data
-        self.test_data = test_data
-        self.cuda = torch.cuda.is_available()
-        self.layers = layers
-        self.rpath = rpath
-        self.MAX_REPRESENTATION_SIZE = MAX_REPRESENTATION_SIZE
-        self.random_indices = {}
-        self._clean_up()
-        self.attributes_on_gpu = ["backbone"]
+        super().__init__(*args, **kwargs)
+        self.max_representation_size = max_repr_size
+        self.plotter = plotter
+        self.backbone = model
+        self.layers_to_analyze = layers
+        if self.cuda:
+            self.backbone = self.backbone.cuda()
+        self.random_indices_for_layers = {}
 
-    def _clean_up(self):
-        self.activs = torch.tensor([])
-        self.labels = []
-        for handle in self.handles.values():
-            handle.remove()
-        self.handles = {}
+    def plot(self, name):
+        # dependency injection
+        # allows us to dynamically change plotting function while creating different analysis objects
+        self.plotter(self.result, self.rpath, name)
 
-    def analysis(self):
-        train_loader = DataLoader(self.train_data, batch_size=1024, shuffle=True)
-        test_loader = DataLoader(self.test_data, batch_size=1024, shuffle=True)
+    def _hook(self, m, i, o, layer_name: str) -> None:
+        output = o.flatten(start_dim=1).detach().cpu()
+        output = self.subsample_outputs(layer_name, output)
+        self.activs[layer_name] = torch.cat((self.activs[layer_name], output))
 
-        for layer_name in self.layers:
-            print("Linear probe for layer:", layer_name)
-            X_train, y_train = self.collect_activations(train_loader, layer_name)
-            self._clean_up()
-            X_test, y_test = self.collect_activations(test_loader, layer_name)
-            self.backbone = self.backbone.cpu()
-            linear_head = self.train(X_train, y_train)
-            self.result[layer_name] = linear_head.evaluate((X_test, y_test))
-            self._clean_up()
-        return self.result
+    def subsample_outputs(self, layer_name: str, output: torch.Tensor) -> torch.Tensor:
+        """
+        Checks whether num features in output is too big (> self.max_representation_size)
+        and subsamples them if needed to have max_represntation_size.
 
-    def _hook(self, m, i, o, layer_name):
-        output = o.flatten(start_dim=1).cpu().detach()
-        if output.shape[1] > self.MAX_REPRESENTATION_SIZE:
-            if layer_name not in self.random_indices:
-                random_indices = np.random.choice(
-                    output.shape[1], self.MAX_REPRESENTATION_SIZE, replace=False
-                )
-                self.random_indices[layer_name] = random_indices
+        Args:
+            layer_name (str): name of layer for extracted representations
+            output (torch.Tensor): extracted representations
 
-            output = output[:, self.random_indices[layer_name]]
-        self.activs = torch.cat((self.activs, output))
+        Returns:
+            output: (torch.Tensor): subsampled (if needed) matrix of representations
+        """
+        num_features = output.shape[1]
+        if num_features > self.max_representation_size:
+            self.random_indices_for_layers = self.sample_indices_for_layer(
+                layer_name, num_features
+            )
+            output = output[:, self.random_indices_for_layers[layer_name]]
+        return output
 
-    def _insert_hook(self, layer_name):
+    def sample_indices_for_layer(self, layer_name, num_features):
+        if layer_name not in self.random_indices_for_layers: #sample random indices only once
+            random_indices = np.random.choice(
+                num_features, self.max_representation_size, replace=False
+            )
+            self.random_indices_for_layers[layer_name] = random_indices
+        return self.random_indices_for_layers
+
+    def _insert_hook(self, layer_names: list[str]) -> None:
         for name, layer in self.backbone.named_modules():
-            if name == layer_name:
+            if name in layer_names:
                 hook = partial(self._hook, layer_name=name)
                 self.handles[name] = layer.register_forward_hook(hook)
 
     @torch.no_grad()
-    def collect_activations(self, loader, layer_name):
-        self._insert_hook(layer_name)
+    def collect_activations(
+        self, loader, layer_names: list[str]
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        self.activs = {layer: torch.tensor([]) for layer in layer_names}
+        self.labels = []
+        self._insert_hook(layer_names)
         self.backbone.eval()
         if self.cuda:
             self.backbone = self.backbone.cuda()
@@ -254,108 +239,59 @@ class EarlyExit(BaseAnalysis):
             self.labels += [y.item() for y in targets]
         self.labels = torch.tensor(self.labels)
         self.backbone = self.backbone.cpu()
-        return self.activs, self.labels
+        activs, labels = copy.deepcopy(self.activs), copy.deepcopy(self.labels)
+        return activs, labels
+
+
+class Rank(RepresentationsAnalysis):
+    def __init__(self, data: Dataset, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.data = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=True)
+
+    @torch.no_grad()
+    def analysis(self):
+        activations, _ = self.collect_activations(self.data, self.layers_to_analyze)
+        
+        self.result = {"rank": {}}
+        for name, rep in activations.items():
+            try:
+                self.result['rank'][name] = matrix_rank(torch.cov(rep.T)).item()
+            except torch._C._LinAlgError:
+                self.result['rank'][name] = np.nan
+
+
+class EarlyExit(RepresentationsAnalysis):
+    def __init__(self, train_data: Dataset, test_data: Dataset, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_data = train_data
+        self.test_data = test_data
+
+    def analysis(self):
+        train_loader = DataLoader(self.train_data, batch_size=1024, shuffle=True)
+        test_loader = DataLoader(self.test_data, batch_size=1024, shuffle=True)
+
+        for layer_name in self.layers_to_analyze:
+            logger.info(
+                f"Linear probe for layer: {layer_name}.",
+            )
+            X_train, y_train = self.collect_activations(train_loader, [layer_name])
+            X_train = X_train[layer_name]
+            linear_head = self.train(X_train, y_train)
+
+            self.empty_variables()
+            X_test, y_test = self.collect_activations(test_loader, [layer_name])
+            X_test = X_test[layer_name]
+            self.result[layer_name] = linear_head.evaluate((X_test, y_test))
+            self.empty_variables()
+
+        return self.result
 
     def train(self, X, y):
         num_classes = len(set(self.labels))
-        head = LinearProbe(self.activs[0].shape[-1], num_classes)
+        num_features = X.shape[1]
+        head = LinearProbe(num_features, num_classes)
         head.train(X, y)
         return head
-
-    def plot(self, name):
-        fig, axs = plt.subplots(1, 1, figsize=(10, 10))
-        axs.plot([i for i in self.result.values()], "o-")
-        axs.grid()
-        plt.title("Early Exits")
-        plt.ylabel("Accuracy")
-        plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
-        plt.close()
-
-
-class LDA(RepresentationsSpectra):
-        def analysis(self):
-            self.input_shape = {}
-            self.result = {'lda':{}, 'inter':{}, 'intra':{}}
-            if len(self.representations) == 0:
-                self.collect_representations_and_labels()
-            for layer in self.representations.keys():
-                self.result['lda'][layer], self.result['inter'][layer], self.result['intra'][layer] = self.discriminability(layer)
-            return self.result
-
-
-        def _spectra_hook(self, name):
-            def spectra_hook(model, input, output):
-                MAX_REPR_SIZE = 100000
-                representation_size = int(output.numel()/output.shape[0])
-                output = output.flatten(1)
-                if representation_size > MAX_REPR_SIZE:                
-                    output = output[:, np.random.choice(representation_size, MAX_REPR_SIZE, replace=False)]
-                self.representations[name] = self.representations.get(name, []) + [output]
-                self.input_shape[name] = [i for i in input[0].shape[2:]]
-            return spectra_hook
-
-        @torch.no_grad()
-        def collect_representations_and_labels(self):
-            self.labels = []
-            self.model.eval()
-            with torch.no_grad():
-                for x, y, *_ in self.data:
-                    if torch.cuda.is_available():
-                        x = x.cuda()
-                    _ = self.model(x)
-                    self.labels += [i.item() for i in y]
-            for name, rep in self.representations.items():
-                self.representations[name] = torch.cat(rep, dim=0).cpu().detach()
-            
-            for handle in self.handels:
-                handle.remove()
-            return self.representations
-            
-        def discriminability(self, layer,):
-            phi = self.representations[layer]
-            print(layer, phi.shape)
-            labels = np.array(self.labels)
-            phi_norm = torch.nn.functional.normalize(phi,p=2,dim=1)
-            class_centers = {i:phi_norm[labels==i].mean(dim=0) for i in np.unique(labels)}
-            inter_class = torch.pdist(torch.stack([class_centers[i] for i in np.unique(labels)])).pow(2).mean()
-            intra_class = np.mean([(phi_norm[labels==i] - class_centers[i]).norm(dim=1).pow(2).mean() for i in np.unique(labels)])
-            return inter_class/intra_class, inter_class, intra_class
-        
-        def plot(self, name):
-            fig, axs = plt.subplots(1, 1, figsize=(5, 4))
-            axs.plot(self.result['inter'].values(), 'o-',label='Inter-class variance')
-            axs.plot(self.result['intra'].values(),'o-', label='Intra-class variance')
-            axs.set_xticks(np.arange(len(self.result['lda'].values())),np.arange(len(self.result['lda'].values()))+1, rotation=0, fontsize=10)
-            axs.set_xlabel("Layer", fontsize=12)
-            axs.set_xlim(-.4, len(self.result['inter'].values())-0.6)
-            plt.legend(fontsize=12)
-            print(os.path.join(self.rpath, name + ".png"))
-            plt.savefig(os.path.join(self.rpath, name + ".png"), dpi=500)
-            plt.close()
-
-
-class TSNE(LDA):
-        def analysis(self):
-            self.input_shape = {}
-            self.result = {}
-            if len(self.representations) == 0:
-                self.collect_representations_and_labels()
-            for layer in self.representations.keys():
-                self.result[layer] = self.tsne(layer)
-            return self.result
-
-        def tsne(self, layer):
-            phi = self.representations[layer]
-            X_embedded = TSNE(n_components=2, learning_rate='auto',
-                  init='random', perplexity=30, n_iter=1000).fit_transform(phi)
-            return X_embedded
-        
-        def plot(self):
-            for e, (key, val) in enumerate(self.result.items()):
-                fig, axs = plt.subplots(1, 1, figsize=(6, 6))
-                axs.scatter(val[:,0], val[:,1], s=0.5, label=key, color=plt.cm.Set1(np.array(self.labels)/10.))
-                axs.axis('off')
-                plt.savefig(os.path.join(self.rpath, f"t-sne_{key}.png"), dpi=500)
 
 
 if __name__ == "__main__":
